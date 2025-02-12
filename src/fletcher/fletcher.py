@@ -6,7 +6,7 @@ import json
 import pickle
 import itertools
 import numpy as np
-import openstructure as op
+import jax.numpy as jnp
 from pathlib import Path
 from math import exp
 
@@ -78,6 +78,97 @@ def plddt_to_rmsd ( plddt = 0.0 ) :
 
 def plddt_to_bfact ( plddt = 0.0 ) :
   return min ( 999.99, 26.318945069571623 * (plddt_to_rmsd ( plddt ))**2)
+
+
+def extract_coordinates_from_pdb(file_path)
+    useful_info = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            if line.startswith("ATOM"):
+                atom_number = int(line[6:11].strip())
+                atom_name = line[12:16].strip()
+                residue_name = line[17:20].strip()
+                chain_id = line[21].strip()
+                seq_number = int(line[22:26].strip())
+                x = float(line[30.38].strip())
+                y = float(line[38.46].strip())
+                z = float(line[46.54].strip())
+                occupancy = float(line[54:60].strip())
+                temp_factor = float(line[60:66]strip())
+                element = line[76:78].strip())
+
+                #append the data as a row to the list
+                useful_info.append([atom_number,atom_name,residue_name,chain_id,seq_number,x,y,z,occupancy,temp_factor,element])
+
+#create a dataframe 
+df = pd.DataFrame(useful_info, coloumns=["Atom Number","Atom Name","Residue Name","Chain ID","Seq Number","X","Y","Z","Occupancy","Temp Factor","Element")
+return df
+
+def lddt(predicted_points,
+         true_points,
+         true_points_mask,
+         cutoff=15.,
+         per_residue=False):
+  """Measure (approximate) lDDT for a batch of coordinates.
+
+  lDDT is a measure of the difference between the true distance matrix and the
+  distance matrix of the predicted points.  The difference is computed only on
+  points closer than cutoff *in the true structure*.
+
+  This function does not compute the exact lDDT value that the original paper
+  describes because it does not include terms for physical feasibility
+  (e.g. bond length violations). Therefore this is only an approximate
+  lDDT score.
+
+  Args:
+    predicted_points: (batch, length, 3) array of predicted 3D points
+    true_points: (batch, length, 3) array of true 3D points
+    true_points_mask: (batch, length, 1) binary-valued float array.  This mask
+      should be 1 for points that exist in the true points.
+    cutoff: Maximum distance for a pair of points to be included
+    per_residue: If true, return score for each residue.  Note that the overall
+      lDDT is not exactly the mean of the per_residue lDDT's because some
+      residues have more contacts than others.
+
+  Returns:
+    An (approximate, see above) lDDT score in the range 0-1.
+  """
+
+  assert len(predicted_points.shape) == 3
+  assert predicted_points.shape[-1] == 3
+  assert true_points_mask.shape[-1] == 1
+  assert len(true_points_mask.shape) == 3
+
+  # Compute true and predicted distance matrices.
+  dmat_true = jnp.sqrt(1e-10 + jnp.sum(
+      (true_points[:, :, None] - true_points[:, None, :])**2, axis=-1))
+
+  dmat_predicted = jnp.sqrt(1e-10 + jnp.sum(
+      (predicted_points[:, :, None] -
+       predicted_points[:, None, :])**2, axis=-1))
+
+  dists_to_score = (
+      (dmat_true < cutoff).astype(jnp.float32) * true_points_mask *
+      jnp.transpose(true_points_mask, [0, 2, 1]) *
+      (1. - jnp.eye(dmat_true.shape[1]))  # Exclude self-interaction.
+  )
+
+  # Shift unscored distances to be far away.
+  dist_l1 = jnp.abs(dmat_true - dmat_predicted)
+
+  # True lDDT uses a number of fixed bins.
+  # We ignore the physical plausibility correction to lDDT, though.
+  score = 0.25 * ((dist_l1 < 0.5).astype(jnp.float32) +
+                  (dist_l1 < 1.0).astype(jnp.float32) +
+                  (dist_l1 < 2.0).astype(jnp.float32) +
+                  (dist_l1 < 4.0).astype(jnp.float32))
+
+  # Normalize over the appropriate axes.
+  reduce_axes = (-1,) if per_residue else (-2, -1)
+  norm = 1. / (1e-10 + jnp.sum(dists_to_score, axis=reduce_axes))
+  score = norm * (1e-10 + jnp.sum(dists_to_score * score, axis=reduce_axes))
+
+  return score
 
 
 def create_script_file ( filename = "", list_of_hits = [ ] ) :
@@ -213,6 +304,10 @@ if __name__ == '__main__':
                         help = 'Require one residue to be at the c-terminus', \
                         choices = [ 'yes', 'no' ], \
                         default = 'no' )
+
+  parser.add_argument ( '-m', '--model', \
+                        help = 'Reference Model to perform LDDT', \
+                        required = False )
 
   args = parser.parse_args ( )
   
